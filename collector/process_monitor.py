@@ -50,6 +50,8 @@ class ProcessRecord:
     sha256:      str                     # SHA-256 of the executable binary
     alive:       bool = True             # False once termination is detected
     parent_exe:  str  = "UNKNOWN"        # Resolved parent exe path
+    last_cpu_time: float = 0.0           # For tracking recent CPU deltas
+    cpu_delta:   float = 0.0             # Delta since last poll
 
     def to_dict(self) -> dict:
         return {
@@ -235,7 +237,7 @@ class ProcessMonitor:
             live_pids = set()
 
             for proc in psutil.process_iter(
-                attrs=["pid", "name", "exe", "ppid", "create_time", "cmdline"],
+                attrs=["pid", "name", "exe", "ppid", "create_time", "cmdline", "cpu_times"],
                 ad_value=None,
             ):
                 info = proc.info
@@ -249,14 +251,25 @@ class ProcessMonitor:
 
                 live_pids.add(pid)
 
+                try:
+                    cpu_t = info.get("cpu_times")
+                    current_cpu = (cpu_t.user + cpu_t.system) if cpu_t else 0.0
+                except Exception:
+                    current_cpu = 0.0
+
                 with self._lock:
                     if pid in self._registry:
+                        # Existing process: just update CPU delta
+                        rec = self._registry[pid]
+                        rec.cpu_delta = current_cpu - rec.last_cpu_time
+                        rec.last_cpu_time = current_cpu
                         continue
 
-                record = self._build_record(info)
-                if record:
+                new_rec = self._build_record(info)
+                if new_rec:
                     with self._lock:
-                        self._registry[pid] = record
+                        new_rec.last_cpu_time = current_cpu
+                        self._registry[pid] = new_rec
                         self.total_seen += 1
 
             now = time.time()
