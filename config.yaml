@@ -1,0 +1,55 @@
+# ============================================================
+# AI Ransomware Defense System — Stage 1 Configuration
+# ============================================================
+# Edit this file to change monitored paths, DB location, and
+# tuning parameters without touching any Python source code.
+
+# -----------------------------------------------------------
+# File Monitor settings
+# -----------------------------------------------------------
+monitor:
+  paths:
+    - "~/Downloads"
+    - "~/Documents"
+    - "~/Desktop"
+  recursive: true          # Watch subdirectories too
+  dedup_window_ms: 50      # Deduplicate identical file events arriving within 50ms
+
+# -----------------------------------------------------------
+# Process Monitor settings
+# -----------------------------------------------------------
+process_monitor:
+  poll_interval_sec: 1.0   # How often to scan running processes
+  hash_timeout_sec: 2.0    # Max seconds to spend hashing one binary
+  skip_system_pids: true   # Skip PID 0, 4 (System/Idle on Windows)
+
+# -----------------------------------------------------------
+# Queue settings
+# -----------------------------------------------------------
+queue:
+  maxsize: 100000          # Max events buffered before back-pressure (burst handling)
+  join_timeout_sec: 0.5    # How long queue_joiner waits for a PID match
+
+# -----------------------------------------------------------
+# SQLite persistence
+# -----------------------------------------------------------
+database:
+  path: "telemetry.db"     # Relative to project root
+  wal_mode: true           # Enable WAL for concurrent read/write
+  batch_size: 500          # Events to batch-insert per DB transaction
+
+# -----------------------------------------------------------
+# Logging
+# -----------------------------------------------------------
+logging:
+  level: "INFO"            # DEBUG | INFO | WARNING | ERROR
+  console: true
+  file: "logs/stage1.log"
+
+# -----------------------------------------------------------
+# Stage 1 tuning (TDEW decay constant used by Stage 3,
+# defined here so Stage 1 can tag events for downstream)
+# -----------------------------------------------------------
+telemetry:
+  decay_lambda: 0.01       # λ for TDEW (Stage 3 will read this)
+  ecar_version: "1.0"
