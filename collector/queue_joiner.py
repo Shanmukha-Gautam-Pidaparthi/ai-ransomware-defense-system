@@ -237,10 +237,12 @@ class QueueJoiner:
             target_path_lower = file_path.lower()
             target_basename   = os.path.basename(target_path_lower)
 
-            # 1. Check active & recently exited processes from ProcessMonitor
+            # 1. Check active & recently exited processes from ProcessMonitor (created in last 300s or active)
+            now = time.time()
             candidates = [
                 rec for rec in self._pm.all_alive()
-                if rec.exe and not rec.exe.startswith("SYSTEM") and "windows" not in rec.exe.lower()
+                if rec.exe and not rec.exe.startswith("SYSTEM") and rec.pid not in (0, 4)
+                and (now - rec.create_time < 300.0 or rec.pid == os.getpid())
             ]
 
             for rec in candidates:
@@ -275,8 +277,7 @@ class QueueJoiner:
         try:
             user_procs = [
                 rec for rec in self._pm.all_alive()
-                if rec.exe and not rec.exe.startswith("SYSTEM") and "windows" not in rec.exe.lower()
-                and (now - rec.create_time < 300.0 or rec.pid == os.getpid())
+                if rec.exe and not rec.exe.startswith("SYSTEM") and rec.pid not in (0, 4)
             ]
 
             for rec in user_procs:
