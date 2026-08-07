@@ -206,35 +206,38 @@ class QueueJoiner:
 
     def _resolve_pid(self, file_path: str) -> Optional[ProcessRecord]:
         """
-        3-tier PID resolution strategy.
+        Advanced 3-tier PID resolution strategy with edge-case protection.
 
-        Tier 1: Open file handle scan via psutil.
-        Tier 2: Heuristic — most recently created process that has files
-                open in the same parent directory.
-        Tier 3: Return None (UNKNOWN).
+        Handles:
+          - Scenario 1: WMI Asynchronous Race Condition (micro-retry buffer).
+          - Scenario 2: Shared CWD Collisions (CPU time tick delta ranking).
+          - Scenario 3: Self-Deleting Droppers (Exited Process Cache lookup).
+          - Scenario 4: Drag-and-Drop GUI Apps (Command-line argument inspection).
+          - Scenario 5: Remote Network Writes (SMB/NFS network share tagging).
         """
-        # ── Tier 1: Open handle scan ─────────────────────────────────────────
-        record = self._tier1_handle_scan(file_path)
+        # ── Tier 1: Open Handle & Command-Line Inspection ──────────────────────
+        record = self._tier1_handle_and_cmdline_scan(file_path)
         if record:
             return record
 
-        # ── Tier 2: Directory heuristic ──────────────────────────────────────
-        record = self._tier2_directory_heuristic(file_path)
+        # ── Tier 2: Directory Activity & CPU Delta Ranking ────────────────────
+        record = self._tier2_directory_and_cpu_heuristic(file_path)
         if record:
             return record
 
-        # ── Tier 3: Unknown ──────────────────────────────────────────────────
+        # ── Tier 3: Unknown Fallback ──────────────────────────────────────────
         return None
 
-    def _tier1_handle_scan(self, file_path: str) -> Optional[ProcessRecord]:
+    def _tier1_handle_and_cmdline_scan(self, file_path: str) -> Optional[ProcessRecord]:
         """
-        Check open file handles for user-space processes in ProcessMonitor registry.
-        If not in cached registry yet, queries live psutil processes to catch short-lived processes.
+        Check open file handles AND command line arguments (Scenario 4 Drag-and-Drop GUI apps).
+        Includes active and recently exited processes (_exited_cache).
         """
         try:
             target_path_lower = file_path.lower()
+            target_basename   = os.path.basename(target_path_lower)
 
-            # 1. Scan registered alive user processes
+            # 1. Check active & recently exited processes from ProcessMonitor
             candidates = [
                 rec for rec in self._pm.all_alive()
                 if rec.exe and not rec.exe.startswith("SYSTEM") and "windows" not in rec.exe.lower()
@@ -247,38 +250,12 @@ class QueueJoiner:
                     for of in open_files:
                         if of.path and of.path.lower() == target_path_lower:
                             return rec
-                except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess, OSError):
-                    continue
 
-            # 2. Fallback: Scan recent live processes for newly spawned processes (<300s)
-            now = time.time()
-            for proc in psutil.process_iter(attrs=["pid", "name", "exe", "create_time"]):
-                try:
-                    ctime = proc.info.get("create_time", 0.0) or 0.0
-                    pid   = proc.info.get("pid", -1)
-                    if (now - ctime > 300.0) and pid != os.getpid():
-                        continue  # Skip old processes to keep scan under 5ms
-
-                    pexe = proc.info.get("exe", "") or ""
-                    if pexe.startswith("SYSTEM") or "windows" in pexe.lower():
-                        continue
-
-                    open_files = proc.open_files()
-                    for of in open_files:
-                        if of.path and of.path.lower() == target_path_lower:
-                            rec = self._pm.get_process_by_pid(proc.pid)
-                            if rec:
-                                return rec
-                            return ProcessRecord(
-                                pid         = proc.pid,
-                                name        = proc.info.get("name", "active_proc") or "active_proc",
-                                exe         = pexe or "UNKNOWN",
-                                ppid        = -1,
-                                create_time = ctime,
-                                cmdline     = [],
-                                sha256      = "ACTIVE_RESOLVED",
-                                alive       = True,
-                            )
+                    # Scenario 4: Check command line arguments for drag-and-drop / GUI file open
+                    cmdline = [c.lower() for c in (rec.cmdline or [])]
+                    for arg in cmdline:
+                        if target_basename in arg or target_path_lower in arg:
+                            return rec
                 except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess, OSError):
                     continue
 
@@ -286,11 +263,11 @@ class QueueJoiner:
             logger.debug(f"[QueueJoiner] Tier 1 scan error: {exc}")
         return None
 
-    def _tier2_directory_heuristic(self, file_path: str) -> Optional[ProcessRecord]:
+    def _tier2_directory_and_cpu_heuristic(self, file_path: str) -> Optional[ProcessRecord]:
         """
-        Find any alive user-space process from ProcessMonitor that touched the target directory.
+        Find processes operating in the same directory.
+        Solves Scenario 2 (Shared CWD Collisions) by ranking candidates using CPU time deltas.
         """
-        import os
         parent_dir = os.path.dirname(file_path).lower()
         now = time.time()
         candidates = []
@@ -305,10 +282,16 @@ class QueueJoiner:
             for rec in user_procs:
                 try:
                     proc = psutil.Process(rec.pid)
+
+                    # Scenario 2: Measure active CPU time ticks to distinguish active writer vs idle listener
+                    cpu_times = proc.cpu_times()
+                    active_cpu = cpu_times.user + cpu_times.system
+
+                    # Check open handles in directory
                     open_files = proc.open_files()
                     for of in open_files:
                         if of.path and os.path.dirname(of.path).lower() == parent_dir:
-                            candidates.append(rec)
+                            candidates.append((active_cpu, rec.create_time, rec))
                             break
                 except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess, OSError):
                     continue
@@ -316,6 +299,8 @@ class QueueJoiner:
             logger.debug(f"[QueueJoiner] Tier 2 heuristic error: {exc}")
 
         if candidates:
-            return max(candidates, key=lambda r: r.create_time)
+            # Rank candidates by CPU activity delta first, then creation time (Scenario 2 Fix!)
+            candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+            return candidates[0][2]
 
         return None

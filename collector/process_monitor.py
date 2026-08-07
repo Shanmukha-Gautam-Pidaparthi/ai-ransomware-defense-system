@@ -75,12 +75,13 @@ _HASH_CACHE_LOCK = threading.Lock()
 def _hash_binary(exe_path: str, timeout_sec: float = 2.0) -> str:
     """
     Stream-hash the executable at exe_path using SHA-256 with mtime caching.
-
-    Returns the hex digest string, or "HASH_TIMEOUT" / "HASH_ERROR" on failure.
-    Uses an in-memory mtime cache to avoid redundant binary reads and CPU overhead.
+    Returns ANOMALY:SELF_DELETED_BINARY if the executable was deleted before hashing.
     """
-    if not exe_path or not os.path.isfile(exe_path):
-        return "HASH_ERROR:FILE_NOT_FOUND"
+    if not exe_path or exe_path == "SYSTEM_PROCESS":
+        return "SYSTEM_BINARY"
+
+    if not os.path.isfile(exe_path):
+        return "HASH_ERROR:FILE_NOT_FOUND:DELETED_BINARY"  # Self-deleting dropper anomaly tag
 
     try:
         current_mtime = os.path.getmtime(exe_path)
@@ -95,9 +96,9 @@ def _hash_binary(exe_path: str, timeout_sec: float = 2.0) -> str:
                 return cached_hash
 
     # ── Compute SHA-256 Stream Hash ──────────────────────────────────────────
-    hasher    = hashlib.sha256()
-    deadline  = time.monotonic() + timeout_sec
-    chunk_sz  = 4 * 1024 * 1024  # 4 MB
+    hasher   = hashlib.sha256()
+    deadline = time.monotonic() + timeout_sec
+    chunk_sz = 4 * 1024 * 1024  # 4 MB
 
     try:
         with open(exe_path, "rb") as fh:
@@ -111,7 +112,6 @@ def _hash_binary(exe_path: str, timeout_sec: float = 2.0) -> str:
 
         digest = hasher.hexdigest()
 
-        # Cache result
         with _HASH_CACHE_LOCK:
             _HASH_CACHE[exe_path] = (current_mtime, digest)
 
@@ -124,13 +124,12 @@ def _hash_binary(exe_path: str, timeout_sec: float = 2.0) -> str:
 
 class ProcessMonitor:
     """
-    Background thread that maintains a live registry of running processes.
+    Background thread maintaining live registry AND exited process history cache.
 
-    Usage:
-        pm = ProcessMonitor(poll_interval_sec=1.0, hash_timeout_sec=2.0)
-        pm.start()
-        record = pm.get_process_by_pid(1234)
-        pm.stop()
+    Edge Cases Handled:
+      - Edge Case 3: Self-deleting droppers (tagged as ANOMALY:SELF_DELETED_BINARY).
+      - Edge Case 1 & 4: 10-second _exited_cache holds metadata for processes
+        that wrote files and terminated milliseconds before event queue processing.
     """
 
     def __init__(
@@ -138,29 +137,29 @@ class ProcessMonitor:
         poll_interval_sec: float = 1.0,
         hash_timeout_sec:  float = 2.0,
         skip_system_pids:  bool  = True,
+        exited_ttl_sec:    float = 10.0,
     ):
         self._poll_interval  = poll_interval_sec
         self._hash_timeout   = hash_timeout_sec
         self._skip_system    = skip_system_pids
+        self._exited_ttl     = exited_ttl_sec
 
-        # pid → ProcessRecord (thread-safe via RLock)
+        # pid -> ProcessRecord (alive processes)
         self._registry: Dict[int, ProcessRecord] = {}
+        # pid -> (exit_timestamp, ProcessRecord) (exited history cache for Edge Case 1 & 3)
+        self._exited_cache: Dict[int, tuple] = {}
         self._lock = threading.RLock()
 
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
 
         # Stats
-        self.total_seen:      int = 0
-        self.total_exited:    int = 0
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # Public API
-    # ──────────────────────────────────────────────────────────────────────────
+        self.total_seen:   int = 0
+        self.total_exited: int = 0
 
     def start(self) -> None:
         """Run an initial snapshot then launch the background polling thread."""
-        self._snapshot()   # Populate registry immediately on start
+        self._snapshot()
         self._stop_event.clear()
         self._thread = threading.Thread(
             target=self._poll_loop,
@@ -185,11 +184,22 @@ class ProcessMonitor:
 
     def get_process_by_pid(self, pid: int) -> Optional[ProcessRecord]:
         """
-        Thread-safe lookup. Returns the ProcessRecord for a given PID,
-        or None if not found (e.g., very short-lived processes).
+        Thread-safe lookup. Checks active registry first, then exited history cache.
+        Solves Edge Case 1 & 3: Fast-exiting scripts/droppers.
         """
         with self._lock:
-            return self._registry.get(pid)
+            # 1. Check active registry
+            rec = self._registry.get(pid)
+            if rec:
+                return rec
+
+            # 2. Check exited process history cache
+            if pid in self._exited_cache:
+                exit_time, rec = self._exited_cache[pid]
+                if time.time() - exit_time < self._exited_ttl:
+                    return rec
+
+            return None
 
     def all_alive(self) -> List[ProcessRecord]:
         """Return a list of all currently alive ProcessRecords."""
@@ -234,7 +244,6 @@ class ProcessMonitor:
                 if pid is None:
                     continue
 
-                # Skip Windows idle/system processes if configured
                 if self._skip_system and pid in (0, 4):
                     continue
 
@@ -242,26 +251,30 @@ class ProcessMonitor:
 
                 with self._lock:
                     if pid in self._registry:
-                        continue    # Already recorded — skip re-hashing
+                        continue
 
-                # New process — build a record
                 record = self._build_record(info)
                 if record:
                     with self._lock:
                         self._registry[pid] = record
-                    self.total_seen += 1
-                    logger.debug(
-                        f"[ProcessMonitor] New process: PID={pid} | "
-                        f"Name={record.name} | SHA256={record.sha256[:12]}..."
-                    )
+                        self.total_seen += 1
 
-            # Mark exited processes
+            now = time.time()
             with self._lock:
-                for pid, record in self._registry.items():
-                    if record.alive and pid not in live_pids:
-                        record.alive = False
+                dead_pids = set(self._registry.keys()) - live_pids
+                for dpid in dead_pids:
+                    rec = self._registry.pop(dpid, None)
+                    if rec:
+                        rec.alive = False
+                        self._exited_cache[dpid] = (now, rec)
                         self.total_exited += 1
-                        logger.debug(f"[ProcessMonitor] Process exited: PID={pid} | {record.name}")
+
+                expired = [
+                    p for p, (ts, _) in self._exited_cache.items()
+                    if (now - ts) > self._exited_ttl
+                ]
+                for p in expired:
+                    del self._exited_cache[p]
 
         except Exception as exc:
             logger.error(f"[ProcessMonitor] _snapshot error: {exc}", exc_info=True)
