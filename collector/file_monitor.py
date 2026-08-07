@@ -83,26 +83,23 @@ class _RansomwareFileEventHandler(FileSystemEventHandler):
         self._clean_counter = 0
 
     def on_created(self, event: FileCreatedEvent) -> None:
-        if not event.is_directory:
-            self._enqueue(event.src_path, "created")
+        self._enqueue(event.src_path, "created", is_directory=event.is_directory)
 
     def on_modified(self, event: FileModifiedEvent) -> None:
-        if not event.is_directory:
-            self._enqueue(event.src_path, "modified")
+        self._enqueue(event.src_path, "modified", is_directory=event.is_directory)
 
     def on_deleted(self, event: FileDeletedEvent) -> None:
-        if not event.is_directory:
-            self._enqueue(event.src_path, "deleted")
+        self._enqueue(event.src_path, "deleted", is_directory=event.is_directory)
 
     def on_moved(self, event: FileMovedEvent) -> None:
-        if not event.is_directory:
-            self._enqueue(event.src_path, "moved", dest_path=event.dest_path)
+        self._enqueue(event.src_path, "moved", dest_path=event.dest_path, is_directory=event.is_directory)
 
     def _enqueue(
         self,
         file_path: str,
         operation: str,
         dest_path: Optional[str] = None,
+        is_directory: bool = False,
     ) -> None:
         """
         Build a minimal raw event dict and non-blockingly put it in the queue.
@@ -179,16 +176,14 @@ class FileMonitor:
 
         valid_paths: List[str] = []
         for path in self._paths:
-            if not Path(path).exists():
-                logger.warning(f"[FileMonitor] Path does not exist, skipping: {path}")
-                continue
-            self._observer.schedule(
-                self._handler,
-                path,
-                recursive=self._recursive,
-            )
-            valid_paths.append(path)
-            logger.info(f"[FileMonitor] Watching: {path} (recursive={self._recursive})")
+            p = Path(path)
+            try:
+                p.mkdir(parents=True, exist_ok=True)
+                self._observer.schedule(self._handler, str(p), recursive=self._recursive)
+                valid_paths.append(str(p))
+                logger.info(f"[FileMonitor] Watching path: {p} (recursive={self._recursive})")
+            except Exception as exc:
+                logger.warning(f"[FileMonitor] Could not watch path {p}: {exc}")
 
         if not valid_paths:
             raise RuntimeError(
