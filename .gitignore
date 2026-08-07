@@ -1,0 +1,28 @@
+# ============================================================
+# AI Ransomware Defense System — Git Ignore
+# ============================================================
+
+# Python bytecode and caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Local databases and WAL files (generated at runtime)
+*.db
+*.db-wal
+*.db-shm
+telemetry.db
+
+# Log files
+logs/
+*.log
+
+# Environment & IDE settings
+.env
+.venv/
+env/
+venv/
+.vscode/
+.idea/
