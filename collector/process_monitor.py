@@ -52,6 +52,10 @@ class ProcessRecord:
     parent_exe:  str  = "UNKNOWN"        # Resolved parent exe path
     last_cpu_time: float = 0.0           # For tracking recent CPU deltas
     cpu_delta:   float = 0.0             # Delta since last poll
+    last_write_bytes: int = 0            # Tracking I/O write bytes
+    last_write_count: int = 0            # Tracking I/O write count
+    dw_bytes:    int = 0                 # Write bytes delta since last poll
+    dw_count:    int = 0                 # Write count delta since last poll
 
     def to_dict(self) -> dict:
         return {
@@ -208,6 +212,16 @@ class ProcessMonitor:
         with self._lock:
             return [r for r in self._registry.values() if r.alive]
 
+    def all_recent_records(self) -> List[ProcessRecord]:
+        """Return all active records plus non-expired exited records."""
+        with self._lock:
+            records = [r for r in self._registry.values() if r.alive]
+            now = time.time()
+            for ts, r in self._exited_cache.values():
+                if (now - ts) < self._exited_ttl:
+                    records.append(r)
+            return records
+
     def snapshot_pids(self) -> List[int]:
         """Return list of all known PIDs (alive + exited)."""
         with self._lock:
@@ -231,7 +245,8 @@ class ProcessMonitor:
 
         1. Collect current live PIDs from psutil.
         2. Register new PIDs (hash binary, build ProcessRecord).
-        3. Mark departed PIDs as alive=False.
+        3. Update CPU and I/O write deltas.
+        4. Mark departed PIDs as alive=False.
         """
         try:
             live_pids = set()
@@ -257,18 +272,33 @@ class ProcessMonitor:
                 except Exception:
                     current_cpu = 0.0
 
+                try:
+                    io = proc.io_counters() if hasattr(proc, 'io_counters') else None
+                    w_bytes = io.write_bytes if io else 0
+                    w_count = io.write_count if io else 0
+                except Exception:
+                    w_bytes = 0
+                    w_count = 0
+
                 with self._lock:
                     if pid in self._registry:
-                        # Existing process: just update CPU delta
+                        # Existing process: update CPU and I/O deltas
                         rec = self._registry[pid]
                         rec.cpu_delta = current_cpu - rec.last_cpu_time
                         rec.last_cpu_time = current_cpu
+                        
+                        rec.dw_bytes = (w_bytes - rec.last_write_bytes) if w_bytes >= rec.last_write_bytes else 0
+                        rec.dw_count = (w_count - rec.last_write_count) if w_count >= rec.last_write_count else 0
+                        rec.last_write_bytes = w_bytes
+                        rec.last_write_count = w_count
                         continue
 
                 new_rec = self._build_record(info)
                 if new_rec:
                     with self._lock:
                         new_rec.last_cpu_time = current_cpu
+                        new_rec.last_write_bytes = w_bytes
+                        new_rec.last_write_count = w_count
                         self._registry[pid] = new_rec
                         self.total_seen += 1
 

@@ -32,12 +32,13 @@ Windows PID Join Strategy:
 This is the standard EDR approach even in commercial products.
 """
 
+import datetime
 import logging
 import os
 import queue
 import threading
 import time
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List, Tuple
 
 import psutil
 
@@ -49,6 +50,30 @@ logger = logging.getLogger(__name__)
 
 # Sentinel to signal the joiner thread to exit
 _STOP_SENTINEL = object()
+
+
+def get_foreground_pid() -> Optional[int]:
+    """Returns the PID of the process owning the currently active foreground window."""
+    try:
+        user32 = ctypes.windll.user32
+        hwnd = user32.GetForegroundWindow()
+        if not hwnd:
+            return None
+        pid = ctypes.c_ulong()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        return pid.value if pid.value > 0 else None
+    except Exception:
+        return None
+
+
+def normalize_path(p: str) -> str:
+    """Normalize Windows paths resolving 8.3 short paths and relative paths."""
+    if not p:
+        return ""
+    try:
+        return os.path.realpath(os.path.normpath(p)).lower()
+    except Exception:
+        return os.path.normpath(p).lower()
 
 
 class QueueJoiner:
@@ -161,8 +186,8 @@ class QueueJoiner:
         tid       = raw.get("tid", 0)
         dest_path = raw.get("dest_path")
 
-        # ── PID Resolution: 3-tier fallback ──────────────────────────────────
-        record = self._resolve_pid(file_path)
+        # ── PID Resolution: 3-tier fallback with diagnostic logging ──────────
+        record = self._resolve_pid(file_path, operation=operation, timestamp_ms=timestamp)
 
         if record:
             self.total_joined += 1
@@ -204,130 +229,199 @@ class QueueJoiner:
 
         return ecar
 
-    def _resolve_pid(self, file_path: str) -> Optional[ProcessRecord]:
+    def _resolve_pid(
+        self,
+        file_path: str,
+        operation: str = "FILE_MODIFY",
+        timestamp_ms: Optional[int] = None,
+    ) -> Optional[ProcessRecord]:
         """
-        Advanced PID resolution strategy with edge-case protection and caching.
+        2-Pass Multi-Signal Process Attribution Engine:
+          Pass 1 (Sub-5ms): Evaluates fast metadata (I/O write deltas, recent spawn age, cmdline, CWD)
+          Pass 2 (Sub-2ms): Checks open_files() ONLY on the Top 3 candidate processes.
         """
         now = time.time()
-        
-        # ── Tier 0: Path-to-PID Cache (Solves rapid event burst failures) ──────
+        target_norm = normalize_path(file_path)
+
         if not hasattr(self, '_path_cache'):
             self._path_cache = {}
-            
-        target_path = file_path.lower()
-        if target_path in self._path_cache:
-            cached_record, cached_time = self._path_cache[target_path]
-            if now - cached_time < 5.0:  # 5-second TTL for rapid bursts
+
+        # ── Tier 0: 5-Second Path Cache (Solves rapid event burst attribution) ──
+        if target_norm in self._path_cache:
+            cached_record, cached_time = self._path_cache[target_norm]
+            if (now - cached_time) < 5.0:
+                logger.debug(f"[QueueJoiner] Cache HIT for {file_path} -> PID={cached_record.pid}")
                 return cached_record
 
-        # ── Tier 1: Command-Line Inspection ──────────────────────
-        record = self._tier1_handle_and_cmdline_scan(file_path)
-        
-        # ── Tier 2: Directory Activity & CPU Delta Ranking ────────────────────
-        if not record:
-            record = self._tier2_directory_and_cpu_heuristic(file_path)
-            
-        # ── Tier 3: Unknown Fallback ──────────────────────────────────────────
-        if not record:
-            record = self._tier3_terminal_fallback()
+        record, reason = self._fast_multi_signal_resolve(file_path, target_norm)
 
-        # Cache the result if found
         if record:
-            self._path_cache[target_path] = (record, now)
-            
+            self._path_cache[target_norm] = (record, now)
+            logger.info(
+                f"[PID RESOLVED] File: {os.path.basename(file_path)} | "
+                f"PID={record.pid} ({record.name or record.exe}) | Reason: {reason}"
+            )
+        else:
+            logger.debug(f"[PID UNKNOWN] File: {os.path.basename(file_path)} | Reason: {reason}")
+
         return record
 
-    def _tier1_handle_and_cmdline_scan(self, file_path: str) -> Optional[ProcessRecord]:
+    def _fast_multi_signal_resolve(self, file_path: str, target_norm: str) -> Tuple[Optional[ProcessRecord], str]:
         """
-        Check command line arguments (Scenario 4 Drag-and-Drop GUI apps).
-        Executes in <0.1ms across all processes.
+        High-accuracy, 2-pass Process Attribution Engine.
         """
+        target_base = os.path.basename(target_norm)
+        target_dir  = os.path.dirname(target_norm)
+        now = time.time()
+        my_pid = os.getpid()
+
+        fg_pid = get_foreground_pid()
+        is_dir_op = ("new folder" in target_norm) or (not os.path.splitext(target_norm)[1])
+
+        BACKGROUND_HELPERS = ('antigravity ide.exe', 'antigravity.exe', 'language_server_windows_x64.exe', 'code.exe')
+        SHELLS = ('powershell.exe', 'cmd.exe', 'pwsh.exe', 'bash.exe', 'windowsterminal.exe', 'wt.exe')
+        SKIP_PREFIXES = ('svchost', 'csrss', 'smss', 'services', 'lsass', 'system', 'conhost', 'fontdrvhost', 'searchhost', 'taskhostw')
+
+        candidates: List[Tuple[float, ProcessRecord, List[str]]] = []
+
+        # ── PASS 1: Fast metadata scoring ──────────────────────────────────────────
+        all_records = self._pm.all_recent_records() if hasattr(self._pm, 'all_recent_records') else self._pm.all_alive()
+        
+        # If no recent process in registry scored high, do a live scan for newly spawned processes (< 5s age)
+        known_pids = {r.pid for r in all_records}
+        live_recent_records = []
         try:
-            target_path_lower = file_path.lower()
-            target_basename   = os.path.basename(target_path_lower)
+            for p in psutil.process_iter(['pid', 'name', 'exe', 'cmdline', 'create_time', 'ppid']):
+                try:
+                    pid = p.info['pid']
+                    if pid <= 4 or pid == my_pid or pid in known_pids:
+                        continue
+                    c_time = p.info.get('create_time', 0)
+                    if (now - c_time) < 5.0:
+                        # Newly spawned process not yet in ProcessMonitor registry!
+                        name = p.info.get('name') or "UNKNOWN"
+                        exe  = p.info.get('exe') or ""
+                        cmd  = p.info.get('cmdline') or []
+                        ppid = p.info.get('ppid', -1)
+                        rec  = ProcessRecord(
+                            pid=pid, name=name, exe=exe, ppid=ppid,
+                            create_time=c_time, cmdline=cmd, sha256="PENDING",
+                            alive=True
+                        )
+                        live_recent_records.append(rec)
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
-            candidates = [
-                rec for rec in self._pm.all_alive()
-                if rec.exe and not rec.exe.startswith("SYSTEM") and rec.pid not in (0, 4)
-            ]
+        combined_records = list(all_records) + live_recent_records
 
-            for rec in candidates:
-                cmdline = [c.lower() for c in (rec.cmdline or [])]
+        for rec in combined_records:
+            try:
+                pid = rec.pid
+                if pid <= 4 or pid == my_pid:
+                    continue
+
+                name = (rec.name or "").lower()
+                if name.startswith(SKIP_PREFIXES):
+                    continue
+
+                score = 0.0
+                reasons = []
+
+                # Signal A: Active I/O Write Delta
+                if rec.dw_bytes > 0 or rec.dw_count > 0:
+                    score += min(80.0, 50.0 + (rec.dw_bytes / 1024.0))
+                    reasons.append(f"IO_WRITE_DELTA({rec.dw_bytes}b)")
+
+                # Signal B: Command Line Argument Match
+                cmdline = [c.strip(' "\'').lower() for c in (rec.cmdline or [])]
                 for arg in cmdline:
-                    if target_basename in arg or target_path_lower in arg:
-                        return rec
+                    arg_norm = normalize_path(arg)
+                    if arg_norm == target_norm:
+                        score += 90.0
+                        reasons.append("CMDLINE_EXACT")
+                        break
+                    elif target_base in arg and len(arg) > 3:
+                        score += 50.0
+                        reasons.append("CMDLINE_SUBSTR")
+                        break
 
-        except Exception as exc:
-            logger.debug(f"[QueueJoiner] Tier 1 scan error: {exc}")
-        return None
+                # Signal C: Recent Process Spawn Age (within last 15s)
+                age = now - rec.create_time
+                if age < 15.0:
+                    score += max(20.0, 80.0 - (age * 4.0))
+                    reasons.append(f"RECENT_SPAWN({age:.1f}s)")
 
-    def _tier2_directory_and_cpu_heuristic(self, file_path: str) -> Optional[ProcessRecord]:
-        """
-        Find processes operating in the same directory using CWD.
-        Solves Scenario 2 (Shared CWD Collisions) by ranking candidates using CPU time deltas.
-        """
-        parent_dir = os.path.dirname(file_path).lower()
-        candidates = []
+                # Signal D: Working Directory Match (if process is alive)
+                if rec.alive:
+                    try:
+                        proc = psutil.Process(pid)
+                        cwd = normalize_path(proc.cwd())
+                        if cwd == target_dir:
+                            score += 40.0
+                            reasons.append("CWD_EXACT")
+                        elif target_dir.startswith(cwd) and len(cwd) > 3:
+                            score += 20.0
+                            reasons.append("CWD_PARENT")
+                    except Exception:
+                        pass
 
-        try:
-            user_procs = [
-                rec for rec in self._pm.all_alive()
-                if rec.exe and not rec.exe.startswith("SYSTEM") and rec.pid not in (0, 4)
-            ]
+                # Signal E: Active Foreground Window Ownership (User GUI Action)
+                if fg_pid and pid == fg_pid:
+                    score += 85.0
+                    reasons.append("FOREGROUND_WINDOW_MATCH")
 
-            for rec in user_procs:
+                # Signal F: Explorer Shell Operations (File/Folder action in Explorer)
+                if name == 'explorer.exe':
+                    if (fg_pid and pid == fg_pid) or is_dir_op:
+                        score += 80.0
+                        reasons.append("EXPLORER_SHELL_OP")
+
+                # Signal G: Active Shell Execution (PowerShell / CMD / Terminal)
+                if name in SHELLS:
+                    if rec.cpu_delta > 0.0 or rec.dw_bytes > 0 or rec.dw_count > 0 or (fg_pid and pid == fg_pid):
+                        score += 75.0
+                        reasons.append("ACTIVE_SHELL_ACTIVITY")
+
+                # Signal H: Background IDE / Helper Deprioritization
+                if name in BACKGROUND_HELPERS:
+                    if any(user_dir in target_norm for user_dir in ('downloads', 'desktop', 'documents')):
+                        if "CMDLINE_EXACT" not in reasons:
+                            score -= 120.0
+                            reasons.append("BACKGROUND_IDE_PENALTY")
+
+                if score > 0:
+                    candidates.append((score, rec, reasons))
+
+            except Exception:
+                continue
+
+        if not candidates:
+            return None, "NO_CANDIDATES"
+
+        # Sort candidates descending by Pass 1 score
+        candidates.sort(key=lambda x: x[0], reverse=True)
+
+        # ── PASS 2: Check open handles ONLY for Top 3 candidates ────────────────
+        top_candidates = candidates[:3]
+        for sc, rec, reasons in top_candidates:
+            if rec.alive:
                 try:
                     proc = psutil.Process(rec.pid)
-                    
-                    delta_cpu = rec.cpu_delta
+                    for of in proc.open_files():
+                        of_norm = normalize_path(of.path)
+                        if of_norm == target_norm or (os.path.basename(of_norm) == target_base and target_dir in of_norm):
+                            reasons.append("OPEN_HANDLE_CONFIRMED")
+                            return rec, f"CONFIRMED_HANDLE (Score={sc+100.0:.1f}: {', '.join(reasons)})"
+                except Exception:
+                    pass
 
-                    # Check Current Working Directory
-                    try:
-                        cwd = proc.cwd()
-                        if cwd and cwd.lower() == parent_dir:
-                            candidates.append((delta_cpu, rec.create_time, rec))
-                    except (psutil.AccessDenied, OSError):
-                        pass
-                except (psutil.NoSuchProcess, psutil.ZombieProcess):
-                    continue
-        except Exception as exc:
-            logger.debug(f"[QueueJoiner] Tier 2 heuristic error: {exc}")
+        # Return top candidate from Pass 1 if score >= 30.0
+        top_score, top_rec, top_reasons = top_candidates[0]
+        if top_score >= 30.0:
+            return top_rec, f"HEURISTIC_MATCH (Score={top_score:.1f}: {', '.join(top_reasons)})"
 
-        if candidates:
-            # Rank candidates by CPU activity delta first, then creation time (Scenario 2 Fix!)
-            candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
-            return candidates[0][2]
+        return None, "LOW_SCORE"
 
-        return None
 
-    def _tier3_terminal_fallback(self) -> Optional[ProcessRecord]:
-        """
-        Scenario 6: Terminal commands modifying files out-of-CWD (e.g., PowerShell Add-Content).
-        Real-time CPU tick check on shell processes (<0.1ms).
-        """
-        shells = ('powershell.exe', 'cmd.exe', 'pwsh.exe', 'bash.exe', 'python.exe')
-        candidates = []
-        
-        try:
-            for rec in self._pm.all_alive():
-                if rec.name and rec.name.lower() in shells:
-                    try:
-                        proc = psutil.Process(rec.pid)
-                        cpu_t = proc.cpu_times()
-                        current_cpu = cpu_t.user + cpu_t.system
-                        
-                        delta_cpu = current_cpu - rec.last_cpu_time
-                        if delta_cpu > 0.0001:  # Microsecond CPU tick detected
-                            candidates.append((delta_cpu, rec))
-                            rec.last_cpu_time = current_cpu
-                    except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
-                        continue
-
-            if candidates:
-                candidates.sort(key=lambda x: x[0], reverse=True)
-                return candidates[0][1]
-
-        except Exception as exc:
-            logger.debug(f"[QueueJoiner] Tier 3 fallback error: {exc}")
-
-        return None
