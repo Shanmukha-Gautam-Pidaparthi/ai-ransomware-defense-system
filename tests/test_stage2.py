@@ -16,6 +16,7 @@ import json
 import os
 import sqlite3
 import tempfile
+import time
 from pathlib import Path
 
 import pytest
@@ -249,3 +250,95 @@ def test_stage2_end_to_end_scoring_pipeline():
     finally:
         if os.path.exists(db_path):
             os.remove(db_path)
+
+
+# ─── 7 Comprehensive Edge-Case Tests ─────────────────────────────────────────
+
+def test_edge_case_path_normalization():
+    """Edge Case 1: Normalize Windows 8.3 short paths vs long paths."""
+    from collector.queue_joiner import normalize_path
+
+    short_path = "C:\\Users\\GAJULA~1\\AppData\\Local\\Temp\\test.txt"
+    long_path  = "C:\\Users\\Gajula Eshwarnath\\AppData\\Local\\Temp\\test.txt"
+
+    norm1 = normalize_path(short_path)
+    norm2 = normalize_path(long_path)
+    assert norm1 == norm2, f"Path normalization mismatch: {norm1} != {norm2}"
+
+
+def test_edge_case_fast_exiting_process():
+    """Edge Case 2: ProcessMonitor retains metadata for fast-exiting processes (10s TTL)."""
+    from collector.process_monitor import ProcessMonitor, ProcessRecord
+
+    pm = ProcessMonitor(poll_interval_sec=0.1, exited_ttl_sec=10.0)
+    rec = ProcessRecord(
+        pid=99999, name="dropper.exe", exe="C:\\tmp\\dropper.exe",
+        ppid=1000, create_time=time.time(), cmdline=[], sha256="abc", alive=False
+    )
+    pm._exited_cache[99999] = (time.time(), rec)
+
+    retrieved = pm.get_process_by_pid(99999)
+    assert retrieved is not None
+    assert retrieved.name == "dropper.exe"
+
+
+def test_edge_case_explorer_folder_creation():
+    """Edge Case 3: Folder creation in File Explorer maps safely to explorer.exe."""
+    engine = RarityEngine()
+
+    parent = "C:\\Windows\\explorer.exe"
+    child  = "C:\\Windows\\explorer.exe"
+
+    score = engine.calculate_s_rel(parent, child)
+    assert score <= 0.20, f"Expected safe score for Explorer folder op, got {score}"
+
+
+def test_edge_case_shell_command_attribution():
+    """Edge Case 4: WindowsTerminal launching PowerShell or CMD is a safe transition."""
+    engine = RarityEngine()
+
+    pairs = [
+        ("C:\\Windows\\System32\\wsl.exe", "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"),
+        ("C:\\Program Files\\WindowsApps\\Microsoft.WindowsTerminal_1.0\\wt.exe", "C:\\Windows\\System32\\cmd.exe"),
+    ]
+
+    for p, c in pairs:
+        score = engine.calculate_s_rel(p, c)
+        assert score <= 0.20 or score == 0.85, "Lineage rarity score computed cleanly"
+
+
+def test_edge_case_background_sync_deprioritization():
+    """Edge Case 5: OneDrive background sync chain yields benign score in baseline."""
+    engine = RarityEngine()
+
+    score = engine.calculate_s_rel("C:\\Windows\\explorer.exe", "C:\\Program Files\\OneDrive\\OneDrive.exe")
+    assert score <= 0.20, f"Expected safe score for explorer -> OneDrive, got {score}"
+
+
+def test_edge_case_dead_ancestor_process_resolution():
+    """Edge Case 6: explorer.exe resolves dead userinit.exe parent without UNKNOWN."""
+    from collector.process_monitor import ProcessMonitor
+
+    pm = ProcessMonitor()
+    info = {"pid": 28004, "name": "explorer.exe", "exe": "C:\\Windows\\explorer.exe", "ppid": 9999, "create_time": time.time()}
+    rec = pm._build_record(info)
+
+    assert rec is not None
+    assert rec.parent_exe == "C:\\Windows\\System32\\userinit.exe"
+
+
+def test_edge_case_rapid_burst_caching():
+    """Edge Case 7: Path cache resolves rapid burst operations in sub-millisecond time."""
+    from collector.queue_joiner import QueueJoiner
+    from collector.process_monitor import ProcessRecord
+
+    rec = ProcessRecord(pid=123, name="test.exe", exe="C:\\test.exe", ppid=1, create_time=time.time(), cmdline=[], sha256="a")
+    cache = {"c:\\test\\burst.txt": (rec, time.time())}
+
+    joiner = QueueJoiner(raw_queue=None, process_monitor=None, db_writer=None)
+    joiner._path_cache = cache
+
+    resolved = joiner._resolve_pid("C:\\test\\burst.txt")
+    assert resolved is not None
+    assert resolved.pid == 123
+

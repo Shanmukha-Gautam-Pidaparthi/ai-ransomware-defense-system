@@ -5,12 +5,20 @@ class RarityEngine:
     def __init__(self):
         # Known safe parent-child relationships (Low S_rel Score)
         self.safe_transitions = {
+            "userinit.exe": ["explorer.exe"],
+            "winlogon.exe": ["userinit.exe", "services.exe", "lsass.exe"],
+            "services.exe": ["svchost.exe", "searchindexer.exe"],
+            "svchost.exe": [
+                "windowsterminal.exe", "wt.exe", "whatsapp.root.exe",
+                "msedgewebview2.exe", "onedrive.exe", "conhost.exe"
+            ],
+            "whatsapp.root.exe": ["msedgewebview2.exe"],
             "explorer.exe": [
                 "powershell.exe", "cmd.exe", "pwsh.exe", "winword.exe", "excel.exe",
                 "chrome.exe", "brave.exe", "msedge.exe", "notepad.exe",
                 "python.exe", "pythonw.exe", "py.exe", "code.exe",
                 "taskmgr.exe", "calc.exe", "windowsterminal.exe", "wt.exe",
-                "antigravity.exe", "antigravity ide.exe"
+                "antigravity.exe", "antigravity ide.exe", "onedrive.exe"
             ],
             "windowsterminal.exe": [
                 "powershell.exe", "cmd.exe", "pwsh.exe", "python.exe", "pythonw.exe", "py.exe",

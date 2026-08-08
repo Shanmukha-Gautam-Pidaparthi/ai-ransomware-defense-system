@@ -32,7 +32,7 @@ Windows PID Join Strategy:
 This is the standard EDR approach even in commercial products.
 """
 
-import datetime
+import ctypes
 import logging
 import os
 import queue
@@ -80,17 +80,6 @@ class QueueJoiner:
     """
     Consumer thread: reads raw file events from file_monitor, resolves the
     PID, formats an eCAR event, and forwards it to the DBWriter.
-
-    Usage:
-        joiner = QueueJoiner(
-            raw_queue=raw_q,
-            process_monitor=pm,
-            db_writer=writer,
-            join_timeout_sec=0.5,
-        )
-        joiner.start()
-        ...
-        joiner.stop()
     """
 
     def __init__(
@@ -100,7 +89,7 @@ class QueueJoiner:
         db_writer:        DBWriter,
         join_timeout_sec: float = 0.5,
         ecar_ver:         str   = "1.0",
-        on_event_callback = None,   # Optional: called with each eCAR event (for live display)
+        on_event_callback = None,   # Optional: called with each eCAR event
     ):
         self._raw_queue       = raw_queue
         self._pm              = process_monitor
@@ -116,10 +105,6 @@ class QueueJoiner:
         self.total_joined:   int = 0    # Events where PID was resolved
         self.total_unknown:  int = 0    # Events where PID could not be resolved
         self.total_events:   int = 0    # Total events processed
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # Public API
-    # ──────────────────────────────────────────────────────────────────────────
 
     def start(self) -> None:
         """Start the background joiner thread."""
@@ -143,10 +128,6 @@ class QueueJoiner:
             f"Joined: {self.total_joined} | Unknown PID: {self.total_unknown}"
         )
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # Internal
-    # ──────────────────────────────────────────────────────────────────────────
-
     def _join_loop(self) -> None:
         """
         Main consumer loop.
@@ -168,7 +149,7 @@ class QueueJoiner:
                         try:
                             self._on_event(enriched)
                         except Exception:
-                            pass   # Callback errors must not break the pipeline
+                            pass
 
             except queue.Empty:
                 continue
@@ -180,14 +161,15 @@ class QueueJoiner:
         Step 4: PID join — find the process that caused this file event.
         Step 5: Format and return the context-enriched eCAR event.
         """
-        file_path = raw.get("file_path", "")
-        operation = raw.get("operation", "")
-        timestamp = raw.get("timestamp", now_ms())
-        tid       = raw.get("tid", 0)
-        dest_path = raw.get("dest_path")
+        file_path    = raw.get("file_path", "")
+        operation    = raw.get("operation", "")
+        timestamp    = raw.get("timestamp", now_ms())
+        tid          = raw.get("tid", 0)
+        dest_path    = raw.get("dest_path")
+        is_directory = raw.get("is_directory", False)
 
-        # ── PID Resolution: 3-tier fallback with diagnostic logging ──────────
-        record = self._resolve_pid(file_path, operation=operation, timestamp_ms=timestamp)
+        # ── PID Resolution ───────────────────────────────────────────────────
+        record = self._resolve_pid(file_path, is_directory=is_directory)
 
         if record:
             self.total_joined += 1
@@ -229,15 +211,10 @@ class QueueJoiner:
 
         return ecar
 
-    def _resolve_pid(
-        self,
-        file_path: str,
-        operation: str = "FILE_MODIFY",
-        timestamp_ms: Optional[int] = None,
-    ) -> Optional[ProcessRecord]:
+    def _resolve_pid(self, file_path: str, is_directory: bool = False) -> Optional[ProcessRecord]:
         """
         2-Pass Multi-Signal Process Attribution Engine:
-          Pass 1 (Sub-5ms): Evaluates fast metadata (I/O write deltas, recent spawn age, cmdline, CWD)
+          Pass 1 (Sub-5ms): Evaluates fast metadata (I/O write deltas, recent spawn age, cmdline, CWD, active window)
           Pass 2 (Sub-2ms): Checks open_files() ONLY on the Top 3 candidate processes.
         """
         now = time.time()
@@ -246,14 +223,13 @@ class QueueJoiner:
         if not hasattr(self, '_path_cache'):
             self._path_cache = {}
 
-        # ── Tier 0: 5-Second Path Cache (Solves rapid event burst attribution) ──
+        # ── Tier 0: 5-Second Path Cache ─────────────────────────────────────
         if target_norm in self._path_cache:
             cached_record, cached_time = self._path_cache[target_norm]
             if (now - cached_time) < 5.0:
-                logger.debug(f"[QueueJoiner] Cache HIT for {file_path} -> PID={cached_record.pid}")
                 return cached_record
 
-        record, reason = self._fast_multi_signal_resolve(file_path, target_norm)
+        record, reason = self._fast_multi_signal_resolve(file_path, target_norm, is_directory=is_directory)
 
         if record:
             self._path_cache[target_norm] = (record, now)
@@ -266,7 +242,12 @@ class QueueJoiner:
 
         return record
 
-    def _fast_multi_signal_resolve(self, file_path: str, target_norm: str) -> Tuple[Optional[ProcessRecord], str]:
+    def _fast_multi_signal_resolve(
+        self,
+        file_path: str,
+        target_norm: str,
+        is_directory: bool = False
+    ) -> Tuple[Optional[ProcessRecord], str]:
         """
         High-accuracy, 2-pass Process Attribution Engine.
         """
@@ -276,18 +257,25 @@ class QueueJoiner:
         my_pid = os.getpid()
 
         fg_pid = get_foreground_pid()
-        is_dir_op = ("new folder" in target_norm) or (not os.path.splitext(target_norm)[1])
+        is_dir_op = is_directory or ("new folder" in target_norm) or (not os.path.splitext(target_norm)[1])
 
-        BACKGROUND_HELPERS = ('antigravity ide.exe', 'antigravity.exe', 'language_server_windows_x64.exe', 'code.exe')
+        BACKGROUND_HELPERS = (
+            'antigravity ide.exe', 'antigravity.exe', 'language_server_windows_x64.exe', 'code.exe',
+            'onedrive.exe', 'brave.exe', 'chrome.exe', 'msedge.exe', 'msedgewebview2.exe'
+        )
         SHELLS = ('powershell.exe', 'cmd.exe', 'pwsh.exe', 'bash.exe', 'windowsterminal.exe', 'wt.exe')
-        SKIP_PREFIXES = ('svchost', 'csrss', 'smss', 'services', 'lsass', 'system', 'conhost', 'fontdrvhost', 'searchhost', 'taskhostw')
+        SKIP_PREFIXES = (
+            'svchost', 'csrss', 'smss', 'services', 'lsass', 'system', 'conhost',
+            'fontdrvhost', 'searchhost', 'taskhostw', 'backgroundtaskhost',
+            'runtimebroker', 'sihost', 'dllhost', 'smartscreen', 'compattelrunner'
+        )
 
         candidates: List[Tuple[float, ProcessRecord, List[str]]] = []
 
-        # ── PASS 1: Fast metadata scoring ──────────────────────────────────────────
+        # ── PASS 1: Fast metadata scoring ───────────────────────────────────
         all_records = self._pm.all_recent_records() if hasattr(self._pm, 'all_recent_records') else self._pm.all_alive()
-        
-        # If no recent process in registry scored high, do a live scan for newly spawned processes (< 5s age)
+
+        # Live scan fallback for newly spawned processes (< 5s age) not yet in registry
         known_pids = {r.pid for r in all_records}
         live_recent_records = []
         try:
@@ -298,7 +286,6 @@ class QueueJoiner:
                         continue
                     c_time = p.info.get('create_time', 0)
                     if (now - c_time) < 5.0:
-                        # Newly spawned process not yet in ProcessMonitor registry!
                         name = p.info.get('name') or "UNKNOWN"
                         exe  = p.info.get('exe') or ""
                         cmd  = p.info.get('cmdline') or []
@@ -378,18 +365,18 @@ class QueueJoiner:
                         score += 80.0
                         reasons.append("EXPLORER_SHELL_OP")
 
-                # Signal G: Active Shell Execution (PowerShell / CMD / Terminal)
+                # Signal G: Active Shell Execution (PowerShell / CMD / Terminal Transient Write)
                 if name in SHELLS:
                     if rec.cpu_delta > 0.0 or rec.dw_bytes > 0 or rec.dw_count > 0 or (fg_pid and pid == fg_pid):
-                        score += 75.0
-                        reasons.append("ACTIVE_SHELL_ACTIVITY")
+                        score += 90.0
+                        reasons.append("TRANSIENT_SHELL_WRITE")
 
-                # Signal H: Background IDE / Helper Deprioritization
+                # Signal H: Background IDE & Sync Deprioritization
                 if name in BACKGROUND_HELPERS:
                     if any(user_dir in target_norm for user_dir in ('downloads', 'desktop', 'documents')):
                         if "CMDLINE_EXACT" not in reasons:
                             score -= 120.0
-                            reasons.append("BACKGROUND_IDE_PENALTY")
+                            reasons.append("BACKGROUND_APP_PENALTY")
 
                 if score > 0:
                     candidates.append((score, rec, reasons))
@@ -403,7 +390,7 @@ class QueueJoiner:
         # Sort candidates descending by Pass 1 score
         candidates.sort(key=lambda x: x[0], reverse=True)
 
-        # ── PASS 2: Check open handles ONLY for Top 3 candidates ────────────────
+        # ── PASS 2: Check open handles ONLY for Top 3 candidates ─────────────
         top_candidates = candidates[:3]
         for sc, rec, reasons in top_candidates:
             if rec.alive:
@@ -417,11 +404,10 @@ class QueueJoiner:
                 except Exception:
                     pass
 
-        # Return top candidate from Pass 1 if score >= 30.0
+        # Return top candidate from Pass 1 if score >= 50.0
         top_score, top_rec, top_reasons = top_candidates[0]
-        if top_score >= 30.0:
+        if top_score >= 50.0:
             return top_rec, f"HEURISTIC_MATCH (Score={top_score:.1f}: {', '.join(top_reasons)})"
 
         return None, "LOW_SCORE"
-
 

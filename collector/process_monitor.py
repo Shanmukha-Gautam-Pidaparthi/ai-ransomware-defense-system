@@ -286,7 +286,7 @@ class ProcessMonitor:
                         rec = self._registry[pid]
                         rec.cpu_delta = current_cpu - rec.last_cpu_time
                         rec.last_cpu_time = current_cpu
-                        
+
                         rec.dw_bytes = (w_bytes - rec.last_write_bytes) if w_bytes >= rec.last_write_bytes else 0
                         rec.dw_count = (w_count - rec.last_write_count) if w_count >= rec.last_write_count else 0
                         rec.last_write_bytes = w_bytes
@@ -356,6 +356,14 @@ class ProcessMonitor:
                     parent_exe  = parent_proc.exe() or "UNKNOWN"
                 except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                     parent_exe = "UNKNOWN"
+
+        # Fallback for known Windows system processes whose parent exited at boot
+        if parent_exe == "UNKNOWN":
+            name_lower = name.lower()
+            if name_lower == "explorer.exe":
+                parent_exe = "C:\\Windows\\System32\\userinit.exe"
+            elif name_lower in ("userinit.exe", "services.exe", "lsass.exe"):
+                parent_exe = "C:\\Windows\\System32\\winlogon.exe"
 
         try:
             return ProcessRecord(

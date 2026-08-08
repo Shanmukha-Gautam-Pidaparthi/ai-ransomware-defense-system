@@ -15,6 +15,17 @@ from tracker import LineageTracker
 from rarity_engine import RarityEngine
 from demo_replay import run_academic_demo
 
+def format_path_hierarchy(file_path: str) -> str:
+    """Extracts folder path hierarchy for display (e.g. 'Downloads -> test -> test1')."""
+    if not file_path:
+        return ""
+    norm = os.path.normpath(file_path)
+    parts = [p for p in norm.split(os.sep) if p and p != '\\' and not p.endswith(':')]
+    if len(parts) >= 3:
+        return " -> ".join(parts[-3:])
+    return " -> ".join(parts)
+
+
 def main():
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(line_buffering=True)
@@ -68,6 +79,7 @@ def main():
                 file_path = process.get("file_path", "")
                 chain = process.get("lineage_chain", [os.path.basename(parent_exe), os.path.basename(child_exe)])
                 chain_str = " -> ".join(chain)
+                path_hier = format_path_hierarchy(file_path)
                 
                 # Calculate Lineage Rarity (S_rel)
                 s_rel_score = engine.calculate_s_rel(parent_exe, child_exe)
@@ -75,11 +87,14 @@ def main():
                 # 3. Alerting & Logging Logic
                 if s_rel_score >= 0.8:
                     print(f"[CRITICAL ANOMALY] S_rel: {s_rel_score:.2f} | PID={pid} | {op} | file:{file_path}", flush=True)
-                    print(f"    --> Full Provenance Lineage: {chain_str}", flush=True)
+                    print(f"    --> Process Lineage: {chain_str}", flush=True)
+                    if path_hier:
+                        print(f"    --> Path Hierarchy  : {path_hier}", flush=True)
                 elif s_rel_score >= 0.7:
-                    print(f"[WARNING] Rare Lineage (S_rel: {s_rel_score:.2f}) | PID={pid} | Lineage: {chain_str}", flush=True)
+                    print(f"[WARNING] Rare Lineage (S_rel: {s_rel_score:.2f}) | PID={pid} | Lineage: {chain_str} | Path: {path_hier}", flush=True)
                 else:
-                    print(f"[INFO   ] [Stage 2] {op:<13} | PID={pid:<7} | S_rel={s_rel_score:.2f} (BENIGN) | Lineage: {chain_str} | file:{file_path}", flush=True)
+                    path_tag = f" | Path: {path_hier}" if path_hier else ""
+                    print(f"[INFO   ] [Stage 2] {op:<13} | PID={pid:<7} | S_rel={s_rel_score:.2f} (BENIGN) | Lineage: {chain_str}{path_tag} | file:{file_path}", flush=True)
                     
             # Poll every 0.5 seconds to keep up with Stage 1
             time.sleep(0.5)
