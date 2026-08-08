@@ -126,11 +126,12 @@ class _RansomwareFileEventHandler(FileSystemEventHandler):
                 }
 
         raw_event: Dict[str, Any] = {
-            "file_path":  file_path,
-            "operation":  operation,
-            "tid":        threading.get_ident(),
-            "timestamp":  now,
-            "dest_path":  dest_path,
+            "file_path":    file_path,
+            "operation":    operation,
+            "tid":          threading.get_ident(),
+            "timestamp":    now,
+            "dest_path":    dest_path,
+            "is_directory": is_directory,
         }
 
         try:
