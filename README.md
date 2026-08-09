@@ -2,6 +2,8 @@
 
 ![Python Version](https://img.shields.io/badge/Python-3.11%2B-blue?style=for-the-badge&logo=python)
 ![Stage 1 Status](https://img.shields.io/badge/Stage%201-PASSED%20(20%2F20)-brightgreen?style=for-the-badge&logo=pytest)
+![Stage 2 Status](https://img.shields.io/badge/Stage%202-PASSED%20(14%2F14)-brightgreen?style=for-the-badge&logo=pytest)
+![Stage 3 Status](https://img.shields.io/badge/Stage%203-PASSED%20(28%2F28)-brightgreen?style=for-the-badge&logo=pytest)
 ![Architecture](https://img.shields.io/badge/Architecture-12--Stage%20Pipeline-orange?style=for-the-badge)
 ![License](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)
 
@@ -25,25 +27,25 @@ The pipeline is organized into **11 sequential execution stages** plus a **12th 
 
 ```text
  ┌───────────────────────────────────────────────────────────────────────────────────┐
- │                            STAGE 1: TELEMETRY COLLECTION                          │  <-- COMPLETED & VERIFIED
+ │                            STAGE 1: TELEMETRY COLLECTION                          │  <-- COMPLETED & VERIFIED (20/20)
  │                Asynchronous File I/O Interception, Process Provenance             │
  └─────────────────────────────────────────┬─────────────────────────────────────────┘
                                            │ (eCAR JSON Telemetry Stream in SQLite)
                                            ▼
  ┌───────────────────────────────────────────────────────────────────────────────────┐
- │                      STAGE 2: PROCESS IDENTIFICATION & LINEAGE                    │  <-- UPCOMING NEXT
+ │                      STAGE 2: PROCESS IDENTIFICATION & LINEAGE                    │  <-- COMPLETED & VERIFIED (14/14)
  │                 Provenance Tracing & Parent-Child Lineage Rarity (S_rel)          │
  └─────────────────────────────────────────┬─────────────────────────────────────────┘
-                                           │
+                                           │ (Context-Enriched eCAR Events)
                                            ▼
  ┌───────────────────────────────────────────────────────────────────────────────────┐
- │                STAGE 3: DYNAMIC BEHAVIOR RELATIONSHIP GRAPH (DBRG)                │
+ │                STAGE 3: DYNAMIC BEHAVIOR RELATIONSHIP GRAPH (DBRG)                │  <-- COMPLETED & VERIFIED (28/28)
  │                  Exponential Time-Decayed Edge Weighting (TDEW Engine)            │
  └─────────────────────────────────────────┬─────────────────────────────────────────┘
-                                           │
+                                           │ (Live Process->File Directed Graph)
                                            ▼
  ┌───────────────────────────────────────────────────────────────────────────────────┐
- │                  STAGES 4–5: FEATURE EXTRACTION & ANOMALY MODEL                   │
+ │                  STAGES 4–5: FEATURE EXTRACTION & ANOMALY MODEL                   │  <-- UPCOMING NEXT
  │           4KB Byte Entropy, One-Class Learning (Isolation Forest / Density)       │
  └─────────────────────────────────────────┬─────────────────────────────────────────┘
                                            │
@@ -73,8 +75,8 @@ The pipeline is organized into **11 sequential execution stages** plus a **12th 
 | Stage | Module Name | Primary Role | Status | Hand-off Notes |
 |---|---|---|---|---|
 | **Stage 1** | **Telemetry Collection** | File I/O Interception, Process Provenance, eCAR Schema, SQLite Store | ✅ **Completed & Verified** | 20/20 Pytest Suite Passed. Streams events to `telemetry.db` |
-| **Stage 2** | **Lineage Analysis** | Parent-Child Provenance Tracing & Lineage Rarity ($S_{\text{rel}}$) | ⏳ *Next Step* | Will consume `telemetry_events` table from `telemetry.db` |
-| **Stage 3** | **DBRG Graph Engine** | NetworkX Directed Graph with TDEW Exponential Weight Decay | 📅 *Upcoming* | Reads process-file interaction pairs from Stage 1/2 |
+| **Stage 2** | **Lineage Analysis** | Parent-Child Provenance Tracing & Lineage Rarity ($S_{\text{rel}}$) | ✅ **Completed & Verified** | 14/14 Pytest Suite Passed. Enriches eCAR with lineage context |
+| **Stage 3** | **DBRG Graph Engine** | NetworkX Directed Graph with TDEW Exponential Weight Decay | ✅ **Completed & Verified** | 28/28 Pytest Suite Passed. Builds live process-file interaction graph |
 | **Stage 4** | **Feature Extraction** | 4KB Multi-layer feature extraction & byte entropy profiling | 📅 *Upcoming* | Reads file modification byte streams |
 | **Stage 5** | **Benign Profiling** | One-Class Anomaly Model (Isolation Forest baseline) | 📅 *Upcoming* | Uses `Dataset/RansomwareData.csv` & `Code/preprocessing.ipynb` |
 | **Stage 6** | **Threat Fusion** | Sigmoidal Intent Drift Acceleration Engine | 📅 *Upcoming* | Combines entropy, graph distance, & lineage signals |
@@ -87,112 +89,111 @@ The pipeline is organized into **11 sequential execution stages** plus a **12th 
 
 ---
 
-## 🛡️ Stage 1 Implementation Detail (Completed)
+## 🕸️ Stage 3: Dynamic Behavior Relationship Graph (DBRG + TDEW)
 
-Stage 1 serves as the **telemetry ingestion backbone** for the entire platform.
+Stage 3 translates flat eCAR events into a live, thread-safe directed graph of **Process Nodes $\rightarrow$ File Nodes**.
 
-### Internal Stage 1 Data Flow Architecture
+### Mathematical Foundation: Time-Decayed Edge Weighting (TDEW)
+
+$$\text{Active Event Update: } W(e) = W_{\text{old}} \cdot e^{-\lambda \cdot \Delta t} + 1.0$$
+
+$$\text{Passive Decay Sweep: } W_{\text{passive}} = W_{\text{old}} \cdot e^{-\lambda \cdot \Delta t}$$
+
+* **Burst Acceleration ($\Delta t \approx 0$)**: Rapid modifications accumulate weight ($1.0 \rightarrow 2.0 \rightarrow 3.0 \dots$).
+* **Exponential Decay ($\Delta t \gg 0$)**: Idle periods exponentially shrink weight toward zero.
+* **Garbage Collection**: Background thread prunes edges where $W < 0.01$ and deletes orphan nodes.
+
+### Visual Graph Output (Benign vs Ransomware Scenario)
+
+![Stage 3 DBRG Graph Diagram](stage3_dbrg_graph.png)
 
 ```text
-[ File System Events ] ──> [ FileMonitor ] ──┐
-                                             ├──> [ QueueJoiner ] ──> [ eCAR Formatter ] ──> [ DBWriter ] ──> [ telemetry.db ]
-[ Process Lifecycle ] ──> [ ProcessMonitor ] ┘   (PID Joiner)         (JSON Schema)        (SQLite WAL)
+ Benign Pattern  : Low process out-degree (1-3 files), gradual TDEW decay.
+ Ransomware Burst: High process out-degree (10-1000+ files), synchronous TDEW weight spikes.
 ```
 
-### Sub-Module Specifications (`collector/`)
+### Sub-Module Specifications (`src/stage_3_dbrg/`)
 
-1. **`collector/file_monitor.py`**: Asynchronous file system observer (`watchdog` / `ReadDirectoryChangesW`) capturing `CREATE`, `MODIFY`, `DELETE`, and `MOVE` events. Features a **50ms sliding window deduplication filter** to eliminate Windows event spam.
-2. **`collector/process_monitor.py`**: Background thread tracking process creation/termination and streaming **SHA-256 binary digests** with mtime caching to prevent CPU spikes.
-3. **`collector/queue_joiner.py`**: Thread-safe queue pipeline implementing **3-tier PID resolution** (open handle scan $\rightarrow$ directory heuristic $\rightarrow$ `UNKNOWN` fallback) with live handle query fallback for newly spawned processes.
-4. **`collector/ecar_formatter.py`**: Standardizes all events into MITRE extended Cyber Analytics Repository (eCAR) JSON schema (`actorID`, `objectID`, `pid`, `tid`, `principal`, `timestamp`, `operation`, `context`).
-5. **`collector/db_writer.py`**: SQLite WAL persistence layer with **500-row batching** and dual indexing on `timestamp` and `pid`.
-6. **`collector/main.py`**: Orchestrator entry point with Windows Administrator privilege verification (`IsUserAnAdmin()`) and graceful signal shutdown handling (`Ctrl+C`).
+1. **`src/stage_3_dbrg/tdew_calculator.py`**: TDEW math engine encapsulating active update and passive decay formulas.
+2. **`src/stage_3_dbrg/dbrg_manager.py`**: Thread-safe NetworkX `DiGraph` wrapper with lock protection for concurrent ingestion.
+3. **`src/stage_3_dbrg/garbage_collector.py`**: Background daemon thread conducting periodic passive decay sweeps and orphan cleanup.
+4. **`src/stage_3_dbrg/visualize_dbrg.py`**: Matplotlib & NetworkX side-by-side graph rendering utility.
 
 ---
 
 ## 📁 Project Directory Structure
 
 ```text
-H:/Final_year_project/ai-ransomware-defense-system/
-├── collector/                # 🛡️ Stage 1 Ingestion Pipeline
-│   ├── __init__.py           # Package marker (v1.0.0)
-│   ├── file_monitor.py       # Watchdog observer (50ms event deduplication)
-│   ├── process_monitor.py    # Process monitor & mtime SHA-256 hash cache
-│   ├── queue_joiner.py       # Thread-safe queue & 3-tier PID resolver
-│   ├── ecar_formatter.py     # MITRE eCAR JSON schema formatter
-│   ├── db_writer.py          # SQLite WAL persistence layer (500-row batching)
-│   └── main.py               # Main orchestrator & Admin privilege checker
-├── tests/                    # 🧪 Automated Testing Package
-│   ├── __init__.py           # Test package marker
-│   └── test_stage1.py        # 20-test Pytest suite for Stage 1
-├── Code/                     # 📓 Data Preprocessing & Attack Simulation Notebooks
-│   ├── preprocessing.ipynb   # Model training & feature scaling (Stage 5 baseline)
-│   ├── WatchDog.ipynb        # Prototype watchdog experiment
-│   └── mock_ransomware.ipynb # Synthetic attack simulation script (Stage 8)
-├── Dataset/                  # 📊 Dataset & Benchmark Metadata
-│   ├── RansomwareData.csv    # RISS Behavioral Ransomware Dataset
-│   └── Family Names ID.txt   # Malware family ID mapping reference
-├── config.yaml               # ⚙️ Central System Configuration File
-├── telemetry.db              # 💾 SQLite Event Database (WAL Mode)
-└── README.md                 # 📖 Project Documentation
+ai-ransomware-defense-system/
+├── collector/                    # 🛡️ Stage 1: Ingestion Pipeline
+│   ├── __init__.py               # Package marker
+│   ├── file_monitor.py           # Watchdog observer (50ms event deduplication)
+│   ├── process_monitor.py        # Process monitor & mtime SHA-256 hash cache
+│   ├── queue_joiner.py           # Thread-safe queue & 3-tier PID resolver
+│   ├── ecar_formatter.py         # MITRE eCAR JSON schema formatter
+│   ├── db_writer.py              # SQLite WAL persistence layer
+│   └── main.py                   # Main orchestrator & Admin privilege checker
+├── lineage/                      # 🌲 Stage 2: Lineage Analysis
+│   ├── tracker.py                # Lineage tracker & process tree builder
+│   ├── rarity_engine.py          # Lineage rarity score engine (S_rel)
+│   ├── demo_events.json          # Demo event sample dataset
+│   └── demo_replay.py            # Lineage demo replay utility
+├── src/                          # ⚡ Stage 3+ Source Code
+│   ├── __init__.py               # Root package marker
+│   └── stage_3_dbrg/             # 🕸️ Stage 3: DBRG & TDEW Engine
+│       ├── __init__.py           # Exports DBRGManager, TDEWEngine, GC
+│       ├── tdew_calculator.py    # TDEW exponential decay formula calculator
+│       ├── dbrg_manager.py       # Thread-safe NetworkX DiGraph manager
+│       ├── garbage_collector.py  # Daemon thread for passive edge pruning
+│       └── visualize_dbrg.py    # Graph visualization generator
+├── tests/                        # 🧪 Automated & Manual Test Suite
+│   ├── __init__.py
+│   ├── test_stage1.py            # 20 automated tests for Stage 1
+│   ├── test_stage2.py            # 14 automated tests for Stage 2
+│   ├── test_stage_3_dbrg.py      # 28 automated tests for Stage 3
+│   ├── manual_test_stage_3.py    # 6-item interactive manual verification CLI
+│   └── demo_ransomware_scenario.py # Live ransomware scenario simulation demo
+├── stage3_dbrg_graph.png         # 📊 Generated DBRG visualization diagram
+├── config.yaml                   # ⚙️ System Configuration
+└── README.md                     # 📖 Project Documentation
 ```
 
 ---
 
-## 🚀 Quick Start & Developer Guide
+## 🚀 Quick Start & Verification Guide
 
-### 1. Requirements & Setup
+### 1. Setup Environment
 ```bash
-# Clone repository
-git clone https://github.com/Kalyan-Burada/ai-ransomware-defense-system.git
+git clone https://github.com/Shanmukha-Gautam-Pidaparthi/ai-ransomware-defense-system.git
 cd ai-ransomware-defense-system
 
-# Install dependencies
-pip install watchdog psutil pyyaml pytest scikit-learn pandas numpy
+pip install watchdog psutil pyyaml pytest networkx matplotlib numpy
 ```
 
-### 2. Run Automated Stage 1 Test Suite
+### 2. Run All Automated Unit Test Suites (Stage 1 + Stage 2 + Stage 3)
 ```bash
-python -m pytest tests/test_stage1.py -v
+python3 -m pytest tests/ -v
 ```
-> [!TIP]
-> **Test Suite Note:**  
-> All 20 unit and integration tests verify eCAR schema validity, PID resolution, deduplication, and SQLite WAL batching in ~20 seconds.
 
-### 3. Launch Live Telemetry Collector (Run Terminal as Administrator)
+### 3. Run Stage 3 Interactive Manual Verification CLI
 ```bash
-python collector/main.py
+# Run all 6 verification items interactively
+python3 tests/manual_test_stage_3.py
+
+# Run a specific verification item (e.g. Item 2: Burst Acceleration)
+python3 tests/manual_test_stage_3.py 2
 ```
 
-### 4. Query `telemetry.db` for Stage 2 Development
-Next developers building **Stage 2 (Lineage Analysis)** can query events directly from SQLite:
-```python
-import sqlite3
-
-conn = sqlite3.connect('telemetry.db')
-cur = conn.cursor()
-recent_events = cur.execute(
-    "SELECT timestamp, operation, pid, actor_id, object_id, raw_json "
-    "FROM telemetry_events ORDER BY timestamp DESC LIMIT 10;"
-).fetchall()
-
-for evt in recent_events:
-    print(evt)
+### 4. Run Ransomware Attack Simulation Demo
+```bash
+python3 tests/demo_ransomware_scenario.py
 ```
 
----
-
-## 🤝 Hand-off Guide for Next Steps (Stage 2+)
-
-For team members continuing development:
-
-1. **Stage 1 Hand-off Output:**
-   * All raw OS file and process telemetry is continuously stored in `telemetry.db` $\rightarrow$ table `telemetry_events`.
-   * Column `raw_json` contains full eCAR JSON context (`ppid`, `parent_exe`, `cmdline`, `sha256`, `exe_path`).
-2. **Next Task (Stage 2: Lineage Analysis):**
-   * Build `collector/process_context.py` to calculate parent-child spawning rarity scores ($S_{\text{rel}}$):
-     $$S_{\text{rel}} = 1.0 - \frac{\text{Freq}(P_{\text{parent}} \rightarrow P_{\text{child}})}{\sum \text{Freq}(P_{\text{parent}} \rightarrow \text{All Children})}$$
-   * Flag unseen execution chains (e.g. `winword.exe` $\rightarrow$ `powershell.exe`) with $S_{\text{rel}} = 1.0$.
+### 5. Generate DBRG Graph Visualization
+```bash
+python3 src/stage_3_dbrg/visualize_dbrg.py
+# Saves stage3_dbrg_graph.png to project root
+```
 
 ---
 
