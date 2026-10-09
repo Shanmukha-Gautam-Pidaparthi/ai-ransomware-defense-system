@@ -6,6 +6,7 @@
 ![Stage 3 Status](https://img.shields.io/badge/Stage%203-PASSED%20(28%2F28)-brightgreen?style=for-the-badge&logo=pytest)
 ![Stage 4 Status](https://img.shields.io/badge/Stage%204-PASSED%20(62%2F62)-brightgreen?style=for-the-badge&logo=pytest)
 ![Stage 5 Status](https://img.shields.io/badge/Stage%205-PASSED%20(30%2F30)-brightgreen?style=for-the-badge&logo=pytest)
+![Stage 6 Status](https://img.shields.io/badge/Stage%206-PASSED%20(26%2F26)-brightgreen?style=for-the-badge&logo=pytest)
 ![Architecture](https://img.shields.io/badge/Architecture-12--Stage%20Pipeline-orange?style=for-the-badge)
 ![License](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)
 
@@ -57,10 +58,17 @@ The pipeline is organized into **11 sequential execution stages** plus a **12th 
  │              Dual Isolation Forest + One-Class SVM, Calibrated Threat Fusion      │
  └─────────────────────────────────────────┬─────────────────────────────────────────┘
                                            │ (Anomaly Scores: S_IF, S_OCSVM, S_anomaly, Risk Tiers)
+                                           ▼                     ┌── (S_rel from Stage 2 +
+ ┌───────────────────────────────────────────────────────────────────────────────────┐
+ │              STAGE 6: MULTI-SIGNAL CORROBORATION & SIGMOIDAL ACCELERATION         │  <-- COMPLETED & VERIFIED (26/26)
+ │  Causality Fusion (S_entropy/S_dist/S_dev/S_rel/S_stab) -> IntentDrift + Velocity  │
+ │  Independent of Stage 5's trained model - consumes Stage 2 + Stage 4 signals only  │
+ └─────────────────────────────────────────┬─────────────────────────────────────────┘
+                                           │ (IntentDrift, drift_velocity)
                                            ▼
  ┌───────────────────────────────────────────────────────────────────────────────────┐
- │              STAGES 6–7: THREAT FUSION & DYNAMIC TRUST EVOLUTION ENGINE           │  <-- UPCOMING NEXT
- │           Sigmoidal Intent Drift, Momentum Penalty, Risk Tiers (SAFE -> CRITICAL) │
+ │              STAGE 7: DYNAMIC TRUST EVOLUTION & RISK STATE ENGINE                 │  <-- UPCOMING NEXT
+ │           Momentum Trust Decay, Risk Tiers (SAFE -> MONITOR -> VERIFY -> CRITICAL) │
  └─────────────────────────────────────────┬─────────────────────────────────────────┘
                                            │
                                            ▼
@@ -87,7 +95,7 @@ The pipeline is organized into **11 sequential execution stages** plus a **12th 
 | **Stage 3** | **DBRG Graph Engine** | NetworkX Directed Graph with TDEW Exponential Weight Decay | ✅ **Completed & Verified** | 28/28 Pytest Suite Passed. Builds live process-file interaction graph |
 | **Stage 4** | **Feature Extraction** | 4KB Buffer Sampling, Shannon Entropy, ETD, Hawkes Point Process | ✅ **Completed & Verified** | 62/62 Pytest Suite Passed. Produces per-event feature vectors |
 | **Stage 5** | **Anomaly Scoring (DAC-OCF)** | Dual Isolation Forest + One-Class SVM Fusion, Risk Tier Classification | ✅ **Completed & Verified** | 30/30 Pytest Suite Passed. Fused AUC-ROC=0.64, Models saved to `models/` |
-| **Stage 6** | **Threat Fusion** | Sigmoidal Intent Drift Acceleration Engine | 📅 *Upcoming* | Combines entropy, graph distance, & lineage signals |
+| **Stage 6** | **Threat Fusion** | Multi-Signal Corroboration & Sigmoidal Intent Drift Acceleration | ✅ **Completed & Verified** | 26/26 Pytest Suite Passed. Fuses `S_entropy/S_dist/S_dev/S_rel/S_stab` into `IntentDrift`; independent of Stage 5's model |
 | **Stage 7** | **Trust State Engine** | Momentum Trust Decay Engine & Risk Tiers (SAFE/VERIFY/CRITICAL) | 📅 *Upcoming* | Controls transitions between risk states |
 | **Stage 8** | **Synthetic Harness** | Sandboxed Attack Simulator | 📅 *Upcoming* | Uses `Code/mock_ransomware.ipynb` for red-team validation |
 | **Stage 9** | **Kernel Containment** | SIGSTOP / `NtSuspendProcess` Freeze-Graph Min-Cut Engine | 📅 *Upcoming* | Edmonds-Karp minimum cut capacity optimization |
@@ -208,6 +216,41 @@ $$\text{Score}_{SVM} = \text{sgn}\left(\sum_i \alpha_i K(x_i, x) - \rho\right)$$
 
 ---
 
+## ⚡ Stage 6: Multi-Signal Corroboration & Sigmoidal Acceleration
+
+Stage 6 fuses independent upstream signals into a single `IntentDrift` score, so that no single
+loud signal (e.g. high entropy from a legitimate 7-Zip compression) can trigger containment alone.
+It is intentionally **independent of Stage 5's trained model** — it reads directly from Stage 2
+(lineage) and Stage 4 (behavioral features), giving the pipeline a second, rule-based corroboration
+path alongside Stage 5's statistical one (defense in depth: two different mechanisms must agree).
+
+### Mathematical Foundation: Causality Fusion + Sigmoidal Acceleration
+
+$$S_{\text{composite}} = 0.35 \cdot S_{\text{entropy}} + 0.30 \cdot S_{\text{dist}} + 0.20 \cdot S_{\text{dev}} + 0.10 \cdot S_{\text{rel}} + 0.05 \cdot S_{\text{stab}}$$
+
+$$\text{IntentDrift}(t) = \frac{1}{1 + e^{-\beta(S_{\text{composite}} - \theta)}} \quad (\beta = 10.0,\ \theta = 0.50)$$
+
+$$\frac{d(\text{Drift})}{dt} = \frac{\text{IntentDrift}(t) - \text{IntentDrift}(t - \Delta t)}{\Delta t}$$
+
+### Sub-Module Specifications (`src/stage_6_fusion/`)
+
+1. **`fusion_engine.py`**: `CausalityFusionEngine` — fixed priority-weighted composite score from the 5 upstream signals (weights sum to 1.0, values clamped to `[0, 1]`).
+2. **`drift_engine.py`**: `SigmoidalDriftEngine` — logistic sigmoid transform plus per-PID drift-velocity tracking over time (thread-safe).
+3. **`threat_fusion.py`**: `ThreatFusionEngine` — orchestrator exposing one `score(feature_vector, s_rel, pid, timestamp)` call per event; merges Stage 4's feature dict with Stage 2's `S_rel` at this boundary.
+4. **`demo_stage6_fusion.py`**: Side-by-side benign vs. ransomware-burst demo showing single-signal suppression and multi-signal escalation.
+
+### Verified Properties (26/26 tests passing)
+
+| Property | Verified Behavior |
+|---|---|
+| Single maxed-out signal | `IntentDrift` stays below the 0.50 trigger line |
+| All 5 signals elevated together | `IntentDrift` crosses 0.50 |
+| Escalating trend across events | `drift_velocity` turns positive |
+| Real Stage 4 output shape | Extra keys (`S_ETD`, `lambda_norm`, `branching_n`, ...) ignored without error |
+| Stage 5 independence | No import of `src.stage_5_anomaly` anywhere in Stage 6 |
+
+---
+
 ## 📁 Project Directory Structure
 
 ```text
@@ -239,12 +282,18 @@ ai-ransomware-defense-system/
 │   │   ├── hawkes_engine.py      # Hawkes self-exciting point process tracker
 │   │   ├── etd_engine.py         # Entropy-Topology Divergence (KL-divergence)
 │   │   └── feature_extractor.py  # Multi-layer feature extraction orchestrator
-│   └── stage_5_anomaly/          # 🎯 Stage 5: Anomaly Scoring (DAC-OCF)
-│       ├── __init__.py           # Exports AnomalyScorer, DataPreprocessor, ModelTrainer
-│       ├── preprocessor.py       # Dataset loading, feature selection, scaling
-│       ├── model_trainer.py      # Dual IF + SVM training & evaluation pipeline
-│       ├── anomaly_scorer.py     # Real-time scoring engine (ML + heuristic fallback)
-│       └── train_stage5.py       # Standalone training CLI script
+│   ├── stage_5_anomaly/          # 🎯 Stage 5: Anomaly Scoring (DAC-OCF)
+│   │   ├── __init__.py           # Exports AnomalyScorer, DataPreprocessor, ModelTrainer
+│   │   ├── preprocessor.py       # Dataset loading, feature selection, scaling
+│   │   ├── model_trainer.py      # Dual IF + SVM training & evaluation pipeline
+│   │   ├── anomaly_scorer.py     # Real-time scoring engine (ML + heuristic fallback)
+│   │   └── train_stage5.py       # Standalone training CLI script
+│   └── stage_6_fusion/           # ⚡ Stage 6: Threat Fusion & Sigmoidal Acceleration
+│       ├── __init__.py           # Exports CausalityFusionEngine, SigmoidalDriftEngine, ThreatFusionEngine
+│       ├── fusion_engine.py      # Priority-weighted composite score (S_composite)
+│       ├── drift_engine.py       # Sigmoid transform + per-PID drift velocity tracking
+│       ├── threat_fusion.py      # Orchestrator: merges Stage 2 + Stage 4 signals per event
+│       └── demo_stage6_fusion.py # Benign vs ransomware-burst fusion demo
 ├── models/                       # 💾 Trained Stage 5 Model Artifacts
 │   ├── isolation_forest.joblib   # Trained Isolation Forest model
 │   ├── one_class_svm.joblib      # Trained One-Class SVM model
@@ -258,6 +307,7 @@ ai-ransomware-defense-system/
 │   ├── test_stage_3_dbrg.py      # 28 automated tests for Stage 3
 │   ├── test_stage_4_features.py  # 62 automated tests for Stage 4
 │   ├── test_stage_5_anomaly.py   # 30 automated tests for Stage 5
+│   ├── test_stage_6_fusion.py    # 26 automated tests for Stage 6
 │   ├── manual_test_stage_3.py    # 6-item interactive manual verification CLI
 │   └── demo_ransomware_scenario.py # Live ransomware scenario simulation demo
 ├── stage3_dbrg_graph.png         # 📊 Generated DBRG visualization diagram
@@ -277,12 +327,15 @@ cd ai-ransomware-defense-system
 pip install watchdog psutil pyyaml pytest networkx matplotlib numpy
 ```
 
-### 2. Run All Automated Unit Test Suites (Stage 1 + Stage 2 + Stage 3 + Stage 4 + Stage 5)
+### 2. Run All Automated Unit Test Suites (Stage 1 + Stage 2 + Stage 3 + Stage 4 + Stage 5 + Stage 6)
 ```bash
-python3 -m pytest tests/test_stage1.py tests/test_stage2.py tests/test_stage_3_dbrg.py tests/test_stage_4_features.py tests/test_stage_5_anomaly.py -v
+python3 -m pytest tests/test_stage1.py tests/test_stage2.py tests/test_stage_3_dbrg.py tests/test_stage_4_features.py tests/test_stage_5_anomaly.py tests/test_stage_6_fusion.py -v
 
 # Run Stage 5 tests only
 python3 -m pytest tests/test_stage_5_anomaly.py -v
+
+# Run Stage 6 tests only
+python3 -m pytest tests/test_stage_6_fusion.py -v
 ```
 
 ### 2b. Train Stage 5 Anomaly Detection Models
@@ -312,6 +365,12 @@ python3 tests/demo_ransomware_scenario.py
 ```bash
 python3 src/stage_3_dbrg/visualize_dbrg.py
 # Saves stage3_dbrg_graph.png to project root
+```
+
+### 6. Run Stage 6 Threat Fusion Demo
+```bash
+python3 src/stage_6_fusion/demo_stage6_fusion.py
+# Prints S_composite / IntentDrift / drift_velocity for benign vs ransomware-burst cases
 ```
 
 ---
